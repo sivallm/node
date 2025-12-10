@@ -1,0 +1,28 @@
+{
+  "name": "Node Dev",
+  "image": "node:latest",
+
+  "workspaceFolder": "/workspace",
+
+  "mounts": ["source=/home/ajay/Desktop/node,target=/workspace,type=bind"],
+
+  "forwardPorts": [3000, 4000, 5173],
+
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "editor.formatOnSave": true,
+        "files.autoSave": "off",
+        // "terminal.integrated.defaultProfile.linux": "bash",
+        // "files.eol": "\n",
+        // "editor.tabSize": 2,
+        // "editor.insertSpaces": true,
+        // "javascript.validate.enable": false,
+        // "typescript.validate.enable": false,
+        // "npm.packageManager": "npm",
+        // "search.useIgnoreFiles": true,
+        "breadcrumbs.enabled": true
+      }
+    }
+  }
+}
