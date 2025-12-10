@@ -1,0 +1,294 @@
+import express from "express";
+import path from "path";
+import { fileURLToPath } from "url";
+import amqp from "amqplib";
+import pkg from "pg";
+import cors from "cors";
+import { v4 as uuidv4 } from "uuid"; // ✅ Import UUID for unique client ID
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+const PORT = process.env.PORT || 3001;
+
+const { Pool } = pkg;
+
+// PostgreSQL Connection Pool
+const pool = new Pool({
+  user: "admin_user",
+  host: "postgres-service",
+  database: "mydatabase",
+  password: "admin_password",
+  port: 5432,
+});
+
+// RabbitMQ Credentials
+const RABBITMQ_USER = "rabbitmq_user";
+const RABBITMQ_PASS = "rabbitmq_password";
+const RABBITMQ_HOST = "rabbitmq-service";
+const RABBITMQ_URL = `amqp://${RABBITMQ_USER}:${RABBITMQ_PASS}@${RABBITMQ_HOST}:5672`;
+
+// Request Queue
+const QUEUE_YOLO = "inference_requests";
+// Response Queue
+const QUEUE_YOLO_RESULT = "inference_results";
+
+// Request Queue
+const QUEUE_YOLO_OBB = "inference_requests_obb";
+// Response Queue
+const QUEUE_YOLO_RESULT_OBB = "inference_results_obb";
+
+const queues_list = [
+  QUEUE_YOLO,
+  QUEUE_YOLO_RESULT,
+  QUEUE_YOLO_OBB,
+  QUEUE_YOLO_RESULT_OBB,
+];
+
+const request_queue_list = {
+  yolo: QUEUE_YOLO,
+  yolo_obb: QUEUE_YOLO_OBB,
+};
+
+const response_queue_list = [QUEUE_YOLO_RESULT, QUEUE_YOLO_RESULT_OBB];
+
+const RETRIES = 10;
+const DELAY = 10000;
+
+let rabbitConnection;
+let rabbitChannel;
+let request_status;
+// Start Express Server
+app.use(express.static(path.join(__dirname, "public")));
+
+app.post("/upload_image", async (req, res) => {
+  console.log(`🛠️ Received body:`, req.body); // 👈 Add this line
+  const { clientId, image_path, algo, threshold } = req.body;
+
+  if (!clientId || !image_path || !algo) {
+    console.log(`msg Body Error`);
+    return res.status(400).json({ error: "Missing required fields" });
+  }
+
+  const message = {
+    clientId,
+    image_path,
+    algo,
+    threshold: threshold || 0.5,
+  };
+  console.log("📩 Sending message with body:", message);
+  if (
+    message.algo == "yolo11n-obb.pt" ||
+    message.algo == "yolo11_DOTA-v1.5.pt"
+  ) {
+    request_status = await sendMessage(message, request_queue_list["yolo_obb"]);
+  } else {
+    request_status = await sendMessage(message, request_queue_list["yolo"]);
+  }
+
+  if (!request_status) {
+    return res.status(500).json({ error: "Failed to send inference request" });
+  }
+
+  return res.json({
+    success: true,
+    message: "Image inference request sent",
+  });
+});
+const clients = {}; // Store client connections by clientId
+const taskResults = {}; // Store pending results
+
+// SSE Endpoint for Real-time Updates
+app.get("/events", (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+
+  const clientId = uuidv4(); // Unique ID for each client
+  clients[clientId] = res; // Store the connection
+  console.log(`Client connected: ${clientId}`);
+
+  // Send client ID to the client
+  res.write(`event: clientId\ndata: ${clientId}\n\n`);
+
+  // Check for pending results and send them if they exist
+  if (taskResults[clientId]) {
+    res.write(`data: ${taskResults[clientId]}\n\n`);
+    delete taskResults[clientId]; // Clean up after sending
+  }
+
+  // Remove client on disconnect
+  req.on("close", () => {
+    console.log(`Client disconnected: ${clientId}`);
+    delete clients[clientId];
+  });
+});
+
+// ✅ Send updates to a specific client by clientId
+const sendUpdate = (clientId, data) => {
+  if (clients[clientId]) {
+    clients[clientId].write(`data: ${JSON.stringify(data)}\n\n`);
+    console.log(`Sent update to client ${clientId}`);
+  } else {
+    console.log(`Client ${clientId} not connected. Storing result.`);
+    taskResults[clientId] = JSON.stringify(data); // Store for later if disconnected
+  }
+};
+
+app.get("/", (req, res) => {
+  console.log("🔄 Serving index.html");
+  res.sendFile(path.join(__dirname, "public", "index.html"));
+});
+
+// Start the server only after RabbitMQ is connected and consuming results
+(async () => {
+  try {
+    console.log("🚀 Initializing server setup...");
+
+    await connectRabbitMQ(); // Establish RabbitMQ connection
+    await consumeResults(response_queue_list); // Start consuming from result queues
+
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(`✅ Server is running on http://localhost:${PORT}`);
+    });
+  } catch (error) {
+    console.error("❌ RabbitMQ connection failed:", error);
+    process.exit(1); // Exit the process if connection fails
+  }
+})();
+
+async function connectRabbitMQ(retries = RETRIES, delay = DELAY) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      console.log(
+        `⏳ Attempting to connect to RabbitMQ (${i + 1}/${retries})...`
+      );
+      rabbitConnection = await amqp.connect(RABBITMQ_URL);
+      rabbitChannel = await rabbitConnection.createChannel();
+      console.log("✅ Connected to RabbitMQ and channel is ready");
+
+      // Create a persistent queue after connection is established
+      await create_predined_queus(queues_list); // Replace "tasks" with your desired queue name
+      return;
+    } catch (error) {
+      console.error(
+        `❌ RabbitMQ connection attempt ${i + 1} failed:`,
+        error.message
+      );
+      if (i < retries - 1) {
+        console.log(`🔄 Retrying in ${delay / 1000} seconds...`);
+        await new Promise((res) => setTimeout(res, delay));
+      }
+    }
+  }
+  throw new Error("❌ Failed to connect to RabbitMQ after multiple attempts");
+}
+
+async function create_predined_queus(queues_list) {
+  // Null guard clause: Check if queues_list is valid and has at least one queue
+  if (!Array.isArray(queues_list) || queues_list.length === 0) {
+    console.warn(
+      "❌ queues_list is empty or not an array. No queues were created."
+    );
+    return null; // Return early if the input is invalid
+  }
+
+  // Validate that all elements are strings and have length > 1
+  for (const queue of queues_list) {
+    if (typeof queue !== "string" || queue.length <= 0) {
+      console.error(
+        `❌ Invalid queue name: "${queue}". Queue names must be strings with length > 1.`
+      );
+      return null; // Stop execution if any queue name is invalid
+    }
+  }
+
+  if (!rabbitChannel) {
+    throw new Error("❌ RabbitMQ channel is not available");
+  }
+
+  for (const queue of queues_list) {
+    try {
+      // Assert the queue exists or create it if it doesn't
+      await rabbitChannel.assertQueue(queue, { durable: true });
+      // durable: true makes the queue persistent
+      console.log(`✅ Queue "${queue}" is ready (durable)`);
+    } catch (error) {
+      console.error(`❌ Failed to create queue ${queue}:`, error.message);
+      throw error;
+    }
+  }
+}
+
+async function sendMessage(message, queueName) {
+  if (!rabbitChannel) {
+    throw new Error("❌ RabbitMQ channel is not available");
+  }
+
+  try {
+    // Convert the message object to a JSON string
+    const messageString = JSON.stringify(message);
+    console.log(`📤 Attempting to send message to "${queueName}"`);
+    console.log("📦 Message content:", messageString);
+
+    // Send message to the queue with persistent flag
+    rabbitChannel.sendToQueue(queueName, Buffer.from(messageString), {
+      persistent: true,
+    });
+    console.log(`✅ Message sent to queue "${queueName}":`, message);
+    return true;
+  } catch (error) {
+    console.error(
+      `❌ Failed to send message to queue "${queueName}":`,
+      error.message
+    );
+    return false;
+  }
+}
+async function consumeResults(response_queue_list) {
+  await Promise.all(
+    response_queue_list.map(async (queue) => {
+      rabbitChannel.consume(queue, async (msg) => {
+        if (!msg) return;
+
+        const result = JSON.parse(msg.content.toString());
+        console.log(`📥 Received from ${queue}:`, result);
+
+        // Expecting: { clientId, image_path, bbs: [ { x1, y1, x2, y2, class, confidence } ] }
+        if (result?.clientId && result?.bbs) {
+          sendUpdate(result.clientId, result);
+          await storeResult(result);
+        } else {
+          console.warn("⚠️ Incomplete inference result:", result);
+        }
+
+        rabbitChannel.ack(msg);
+      });
+    })
+  );
+}
+
+async function storeResult(result) {
+  const { clientId, image_path, bbs } = result;
+
+  if (!bbs || bbs.length === 0) {
+    console.log("⚠️ No bounding boxes to store.");
+    return;
+  }
+
+  try {
+    for (const bb of bbs) {
+      const { x1, y1, x2, y2, class: class_id, confidence } = bb;
+      await pool.query(
+        "INSERT INTO inference_results (client_id, image_path, class_id, confidence, x1, y1, x2, y2) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        [clientId, image_path, class_id, confidence, x1, y1, x2, y2]
+      );
+    }
+    console.log("✅ All bounding boxes stored in database");
+  } catch (error) {
+    console.error("❌ Failed to store inference results:", error);
+  }
+}

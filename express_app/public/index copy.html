@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Image Input Form</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: flex-start;
+        padding: 20px;
+        background-color: #f4f4f4;
+        height: 100vh;
+        overflow: auto;
+      }
+      .container {
+        background: white;
+        padding: 20px;
+        border-radius: 10px;
+        box-shadow: 0px 4px 6px rgba(0, 0, 0, 0.1);
+        text-align: center;
+        max-width: 100%;
+      }
+      input,
+      button,
+      select {
+        margin: 10px;
+        padding: 8px;
+        border-radius: 5px;
+        border: 1px solid #ccc;
+      }
+      button {
+        background-color: #28a745;
+        color: white;
+        border: none;
+        cursor: pointer;
+      }
+      .input-group {
+        margin-bottom: 20px;
+      }
+      #imageBox {
+        position: relative; /* ✅ NEW */
+        width: 1000px;
+        height: 700px;
+        border: 2px dashed #ccc;
+        overflow: auto;
+        margin-top: 10px;
+        display: none;
+      }
+      #preview {
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+      }
+      #canvasOverlay {
+        position: absolute; /* ✅ NEW */
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+      }
+      #message {
+        margin-top: 10px;
+        font-weight: bold;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="input-group">
+        <input type="file" id="imageInput" accept="image/*" />
+        <div id="imageBox">
+          <img id="preview" src="#" alt="Image Preview" />
+          <canvas id="canvasOverlay"></canvas>
+        </div>
+      </div>
+      <div class="input-group">
+        <label for="dropdown">Select an Algorithm:</label>
+        <select id="dropdown">
+          <option value="yolov8n.pt">Yolo8</option>
+          <option value="yolo11n.pt">yolo11</option>
+          <option value="yolo11n-obb.pt">Yolo11-OBB</option>
+          <option value="yolo11_DOTA-v1.5.pt">DOTA-OBB</option>
+        </select>
+      </div>
+      <div class="input-group">
+        <label for="thresholdInput">Threshold:</label>
+        <input type="range" id="thresholdInput" min="0" max="100" step="1" />
+        <span id="rangeValue">50</span>
+      </div>
+      <p id="message"></p>
+      <button onclick="uploadImage()">ATD</button>
+    </div>
+
+    <script>
+      const eventSource = new EventSource("http://localhost:3001/events");
+
+      eventSource.addEventListener("clientId", (event) => {
+        clientId = event.data;
+        console.log("✅ Connected with clientId:", clientId);
+      });
+      eventSource.onmessage = (event) => {
+        const result = JSON.parse(event.data);
+        console.log("📦 Inference Result:", result);
+        const boxes = result.bbs; // ✅ Extract bbs array
+        console.log("Recieved boxes ", boxes);
+        document.getElementById("message").textContent = "🎯 Result received";
+        document.getElementById("message").style.color = "blue";
+        drawBoundingBoxes_obb(boxes); // ✅ NEW
+        //        drawBoundingBoxes(boxes); // ✅ NEW
+      };
+      eventSource.onerror = (err) => {
+        console.error("❌ SSE Error:", err);
+      };
+      async function uploadImage() {
+        const imageInput = document.getElementById("imageInput");
+        const preview = document.getElementById("preview");
+        const imageBox = document.getElementById("imageBox");
+        const thresholdInput = document.getElementById("thresholdInput");
+        const rangeValue = document.getElementById("rangeValue");
+        const message = document.getElementById("message");
+
+        if (!imageInput.files.length) {
+          alert("Please select an image.");
+          return;
+        }
+
+        let absPath = "/mnt/nas/";
+        let imageName = imageInput.files[0].name;
+        let imagePath = absPath + imageName;
+        console.log("imagePath:", imagePath);
+        try {
+          const uploadRes = await fetch("http://localhost:3001/upload_image", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              clientId: clientId,
+              image_path: imagePath,
+              algo: dropdown.value,
+              threshold: parseFloat(thresholdInput.value) / 100,
+            }),
+          });
+
+          if (!uploadRes.ok) {
+            throw new Error("Image upload failed");
+          }
+
+          message.textContent = "🚀 Inference request sent!";
+          message.style.color = "green";
+        } catch (err) {
+          console.error("❌ Error:", err);
+          message.textContent = "❌ Something went wrong.";
+          message.style.color = "red";
+        }
+      }
+      function drawBoundingBoxes(boxes) {
+        const classNames = {
+          0: "Person",
+          1: "Bicycle",
+          2: "Car",
+          3: "Motorcycle",
+          4: "Airplane",
+          5: "Bus",
+        };
+
+        const classColors = {
+          0: "red",
+          1: "blue",
+          2: "green",
+          3: "orange",
+          4: "purple",
+          5: "teal",
+        };
+        const img = document.getElementById("preview");
+        const canvas = document.getElementById("canvasOverlay");
+        const ctx = canvas.getContext("2d");
+
+        const naturalWidth = img.naturalWidth;
+        const naturalHeight = img.naturalHeight;
+        const displayWidth = img.clientWidth;
+        const displayHeight = img.clientHeight;
+
+        const scale = Math.min(
+          displayWidth / naturalWidth,
+          displayHeight / naturalHeight
+        );
+        const xOffset = (displayWidth - naturalWidth * scale) / 2;
+        const yOffset = (displayHeight - naturalHeight * scale) / 2;
+
+        canvas.width = displayWidth;
+        canvas.height = displayHeight;
+
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        boxes.forEach((box) => {
+          const { x1, y1, x2, y2, class: classId, confidence } = box;
+
+          const sx1 = x1 * scale + xOffset;
+          const sy1 = y1 * scale + yOffset;
+          const sx2 = x2 * scale + xOffset;
+          const sy2 = y2 * scale + yOffset;
+
+          const color = classColors[classId] || "black";
+          const label = `${classNames[classId] || "Class " + classId} (${(
+            confidence * 100
+          ).toFixed(1)}%)`;
+
+          // Draw bounding box
+          ctx.beginPath();
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 2;
+          ctx.rect(sx1, sy1, sx2 - sx1, sy2 - sy1);
+          ctx.stroke();
+
+          // Draw label background
+          ctx.font = "16px Arial";
+          const textWidth = ctx.measureText(label).width;
+          const textHeight = 20;
+          ctx.fillStyle = color;
+          ctx.fillRect(sx1, sy1 - textHeight, textWidth + 6, textHeight);
+
+          // Draw label text
+          ctx.fillStyle = "white";
+          ctx.fillText(label, sx1 + 3, sy1 - 5);
+        });
+      }
+      function drawHardcodedBox() {
+        const img = document.getElementById("preview");
+        const canvas = document.getElementById("canvasOverlay");
+        const ctx = canvas.getContext("2d");
+
+        const naturalWidth = img.naturalWidth;
+        const naturalHeight = img.naturalHeight;
+        const displayWidth = img.clientWidth;
+        const displayHeight = img.clientHeight;
+
+        const scale = Math.min(
+          displayWidth / naturalWidth,
+          displayHeight / naturalHeight
+        );
+        const xOffset = (displayWidth - naturalWidth * scale) / 2;
+        const yOffset = (displayHeight - naturalHeight * scale) / 2;
+
+        canvas.width = displayWidth;
+        canvas.height = displayHeight;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        // Hardcoded OBB points (example: 100x100 square tilted slightly)
+        const box = {
+          x1: 100,
+          y1: 100,
+          x2: 200,
+          y2: 90,
+          x3: 210,
+          y3: 190,
+          x4: 110,
+          y4: 200,
+          class: 0,
+          confidence: 0.95,
+        };
+
+        const points = [
+          [box.x1, box.y1],
+          [box.x2, box.y2],
+          [box.x3, box.y3],
+          [box.x4, box.y4],
+        ].map(([x, y]) => [x * scale + xOffset, y * scale + yOffset]);
+
+        const color = "red";
+        const label = `Plane (${(box.confidence * 100).toFixed(1)}%)`;
+
+        // Draw polygon
+        ctx.beginPath();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 4;
+        ctx.moveTo(points[0][0], points[0][1]);
+        for (let i = 1; i < points.length; i++) {
+          ctx.lineTo(points[i][0], points[i][1]);
+        }
+        ctx.closePath();
+        ctx.stroke();
+
+        // Draw label background
+        ctx.font = "16px Arial";
+        const textWidth = ctx.measureText(label).width;
+        const textHeight = 20;
+        ctx.fillStyle = color;
+        ctx.fillRect(
+          points[0][0],
+          points[0][1] - textHeight,
+          textWidth + 6,
+          textHeight
+        );
+
+        // Draw label text
+        ctx.fillStyle = "white";
+        ctx.fillText(label, points[0][0] + 3, points[0][1] - 5);
+      }
+
+      function drawBoundingBoxes_obb(boxes) {
+        const classColorsByName = {
+          ship: "blue",
+          "storage tank": "green",
+          "baseball diamond": "orange",
+          "tennis court": "purple",
+          "basketball court": "teal",
+          "ground track field": "brown",
+          harbor: "navy",
+          bridge: "maroon",
+          "large vehicle": "darkgreen",
+          "small vehicle": "goldenrod",
+          helicopter: "crimson",
+          roundabout: "darkcyan",
+          "soccer ball field": "olive",
+          "swimming pool": "deepskyblue",
+          person: "black",
+          bus: "red",
+        };
+        const img = document.getElementById("preview");
+        const canvas = document.getElementById("canvasOverlay");
+        const ctx = canvas.getContext("2d");
+
+        const naturalWidth = img.naturalWidth;
+        const naturalHeight = img.naturalHeight;
+        const displayWidth = img.clientWidth;
+        const displayHeight = img.clientHeight;
+
+        const scale = Math.min(
+          displayWidth / naturalWidth,
+          displayHeight / naturalHeight
+        );
+        const xOffset = (displayWidth - naturalWidth * scale) / 2;
+        const yOffset = (displayHeight - naturalHeight * scale) / 2;
+
+        canvas.width = displayWidth;
+        canvas.height = displayHeight;
+
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        console.log("1111111111111111\n");
+        boxes.forEach((box) => {
+          const {
+            x1,
+            y1,
+            x2,
+            y2,
+            x3,
+            y3,
+            x4,
+            y4,
+            class: className,
+            confidence,
+          } = box;
+          console.log("2222222222\n", box);
+          // Scale and offset the polygon points
+          const points = [
+            [x1, y1],
+            [x2, y2],
+            [x3, y3],
+            [x4, y4],
+          ].map(([x, y]) => [x * scale + xOffset, y * scale + yOffset]);
+          console.log("points:", points);
+
+          const label = `${className} (${(confidence * 100).toFixed(1)}%)`;
+          const color = classColorsByName[className.toLowerCase()] || "black";
+
+          // Draw polygon
+
+          ctx.beginPath();
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 4;
+          ctx.moveTo(points[0][0], points[0][1]);
+          for (let i = 1; i < points.length; i++) {
+            ctx.lineTo(points[i][0], points[i][1]);
+          }
+          ctx.closePath();
+          ctx.stroke();
+
+          // Draw label background near the first point
+          ctx.font = "16px Arial";
+          const textWidth = ctx.measureText(label).width;
+          const textHeight = 20;
+          ctx.fillStyle = color;
+          ctx.fillRect(
+            points[0][0],
+            points[0][1] - textHeight,
+            textWidth + 6,
+            textHeight
+          );
+
+          // Draw label text
+          ctx.fillStyle = "white";
+          ctx.fillText(label, points[0][0] + 3, points[0][1] - 5);
+        });
+      }
+
+      const imageInput = document.getElementById("imageInput");
+      const preview = document.getElementById("preview");
+      const imageBox = document.getElementById("imageBox");
+      const thresholdInput = document.getElementById("thresholdInput");
+      const rangeValue = document.getElementById("rangeValue");
+
+      imageInput.addEventListener("change", function () {
+        const file = this.files[0];
+        if (file) {
+          const reader = new FileReader();
+          reader.onload = function (e) {
+            preview.src = e.target.result;
+            imageBox.style.display = "block";
+          };
+          reader.readAsDataURL(file);
+        }
+      });
+      thresholdInput.addEventListener("input", function () {
+        rangeValue.textContent = this.value;
+      });
+      rangeValue.textContent = thresholdInput.value;
+    </script>
+  </body>
+</html>
